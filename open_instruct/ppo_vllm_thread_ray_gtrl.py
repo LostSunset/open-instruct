@@ -251,6 +251,8 @@ class Args:
     """number of vLLM Engines, set to 0 to disable vLLM"""
     vllm_tensor_parallel_size: int = 1
     """tensor parallel size of vLLM Engine for multi-GPU inference"""
+    vllm_enforce_eager: bool = False
+    """whether to enforce eager mode for vLLM -- slow inference but needed for multi-node"""
     vllm_sync_backend: str = "nccl"
     """DeepSpeed -> vLLM weight sync backend"""
     enable_prefix_caching: bool = False
@@ -287,6 +289,8 @@ class Args:
     """Whether to launch beaker evaluation jobs after training"""
     try_launch_beaker_eval_jobs_on_weka: bool = False
     """Whether to launch beaker evaluation jobs after training on weka"""
+    try_auto_save_to_beaker: bool = True
+    """Whether to try to save the model to Beaker dataset `/output` after training"""
     oe_eval_tasks: Optional[List[str]] = None
     """The beaker evaluation tasks to launch"""
     hf_metadata_dataset: Optional[str] = "allenai/tulu-3-evals"
@@ -760,11 +764,11 @@ class PolicyTrainerRayProcess(RayProcess):
             world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
             backend = args.vllm_sync_backend
             # https://github.com/OpenRLHF/OpenRLHF/issues/313
-            if vllm.__version__ > "0.4.2" and os.getenv("NCCL_P2P_DISABLE", "0") == "0":
-                backend = "gloo"
-                print(
-                    "Warning: using --vllm_sync_backend=gloo for vLLM version > 0.4.2 (or export NCCL_P2P_DISABLE=1)"
-                )
+            # if vllm.__version__ > "0.4.2" and os.getenv("NCCL_P2P_DISABLE", "0") == "0":
+            #     backend = "gloo"
+            #     print(
+            #         "Warning: using --vllm_sync_backend=gloo for vLLM version > 0.4.2 (or export NCCL_P2P_DISABLE=1)"
+            #     )
             refs = [
                 engine.init_process_group.remote(
                     master_address,
@@ -998,10 +1002,10 @@ class PolicyTrainerRayProcess(RayProcess):
 
                 start_time = time.time()
                 broadcast_to_vllm()
-                print(
-                    f"🔥🔥🔥 Loading weights using shared memory; Time to load weights: {time.time() - start_time:.2f} seconds"
-                )
                 if accelerator.is_main_process:
+                    print(
+                        f"🔥🔥🔥 Loading weights using shared memory; Time to load weights: {time.time() - start_time:.2f} seconds"
+                    )
                     param_prompt_Q.put((None, remove_padding(global_queries, tokenizer.pad_token_id)))
             else:
                 if training_step != 1:
@@ -1019,10 +1023,10 @@ class PolicyTrainerRayProcess(RayProcess):
                     datasets_next = data[DATASET_SOURCE_KEY]
                     start_time = time.time()
                     broadcast_to_vllm()
-                    print(
-                        f"🔥🔥🔥 Loading weights using shared memory; Time to load weights: {time.time() - start_time:.2f} seconds"
-                    )
                     if accelerator.is_main_process:
+                        print(
+                            f"🔥🔥🔥 Loading weights using shared memory; Time to load weights: {time.time() - start_time:.2f} seconds"
+                        )
                         param_prompt_Q.put((None, remove_padding(global_queries, tokenizer.pad_token_id)))
                     queries = queries_next
                     ground_truths = ground_truths_next
@@ -1373,7 +1377,7 @@ class PolicyTrainerRayProcess(RayProcess):
 
         # Ai2 logic: we use /output to store the artifacts of the job, so we
         # make a copy of the model to `/output` in the end.
-        if self.rank == 0 and len(self.beaker_config.beaker_dataset_id_urls) > 0:
+        if args.try_auto_save_to_beaker and self.rank == 0 and len(self.beaker_config.beaker_dataset_id_urls) > 0 and args.output_dir != "/output":
             shutil.copytree(args.output_dir, "/output", dirs_exist_ok=True)
         print("finished training")
 
@@ -1612,11 +1616,11 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         print(
             f"Dataset splits not provided for all datasets. Using the same {args.dataset_train_splits[0]} split for all datasets."
         )
-    if len(args.dataset_eval_splits) != len(args.dataset_eval_mixer_dict) and len(args.dataset_eval_splits) == 1:
-        args.dataset_eval_splits = [args.dataset_eval_splits[0]] * len(args.dataset_eval_mixer_dict)
-        print(
-            f"Dataset splits not provided for all datasets. Using the same {args.dataset_eval_splits[0]} split for all datasets."
-        )
+    # if len(args.dataset_eval_splits) != len(args.dataset_eval_mixer_dict) and len(args.dataset_eval_splits) == 1:
+    #     args.dataset_eval_splits = [args.dataset_eval_splits[0]] * len(args.dataset_eval_mixer_dict)
+    #     print(
+    #         f"Dataset splits not provided for all datasets. Using the same {args.dataset_eval_splits[0]} split for all datasets."
+    #     )
     train_dataset = combine_dataset(
         args.dataset_mixer_dict,
         splits=args.dataset_train_splits,
@@ -1683,6 +1687,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     vllm_engines = create_vllm_engines(
         args.vllm_num_engines,
         args.vllm_tensor_parallel_size,
+        args.vllm_enforce_eager,
         model_config.model_name_or_path,
         model_config.model_revision,
         args.seed,
