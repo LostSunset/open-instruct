@@ -43,6 +43,11 @@ from dataclasses import asdict, dataclass, field
 from queue import Empty, Queue
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple
 
+from open_instruct.dataset_transformation import (
+    TokenizerConfig,
+    get_cached_dataset_rlvr,
+)
+
 os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
 
 import deepspeed
@@ -54,7 +59,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils
 import torch.utils.data
-from datasets import Dataset, DatasetDict
+from datasets import Dataset
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from huggingface_hub import HfApi
 from ray.util.placement_group import PlacementGroup, placement_group
@@ -63,7 +68,6 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from rich.pretty import pprint
 from torch.utils.tensorboard import SummaryWriter
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -75,12 +79,10 @@ from transformers.integrations import HfDeepSpeedConfig
 from vllm import SamplingParams
 
 from open_instruct.dataset_processor import (
-    CHAT_TEMPLATES,
     DATASET_SOURCE_KEY,
     GROUND_TRUTHS_KEY,
     INPUT_IDS_PROMPT_KEY,
     DatasetConfig,
-    SFTGroundTruthDatasetProcessor,
     SimpleGenerateCollatorWithGroundTruth,
     visualize_token,
 )
@@ -100,7 +102,6 @@ from open_instruct.model_utils import (
 from open_instruct.utils import (
     ArgumentParserPlus,
     BeakerRuntimeConfig,
-    combine_dataset,
     get_wandb_tags,
     is_beaker_job,
     maybe_get_beaker_config,
@@ -117,18 +118,14 @@ INVALID_LOGPROB = 1.0
 @dataclass
 class Args:
     # required dataset args
-    dataset_mixer: str = None
-    """A dictionary of datasets (local or HF) to sample from."""
-    dataset_train_splits: List[str] = None
+    dataset_mixer_list: List[str] = None
+    """A list of datasets (local or HF) to sample from."""
+    dataset_mixer_eval_list: List[str] = None
+    """A list of datasets (local or HF) to sample from for evaluation."""
+    dataset_mixer_list_splits: List[str] = None
     """The dataset splits to use for training"""
-    dataset_eval_mixer: Optional[str] = None
-    """A dictionary of datasets (local or HF) to sample from for evaluation"""
-    dataset_eval_splits: Optional[List[str]] = None
+    dataset_mixer_eval_list_splits: Optional[List[str]] = None
     """The dataset splits to use for evaluation"""
-    dataset_mixer_dict: Optional[dict] = None
-    """The dataset mixer as a dictionary"""
-    dataset_eval_mixer_dict: Optional[dict] = None
-    """The dataset eval mixer as a dictionary"""
 
     # common args
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -215,6 +212,9 @@ class Args:
     """whether to penalize responses that do not contain `stop_token_id`"""
     number_samples_per_prompt: int = 1
     """the number of samples to generate per prompt, useful for easy-star"""
+    stop_strings: List[str] = None
+    """List of strings that stop the generation when they are generated.
+    The returned output will not contain the stop strings."""
 
     # online PPO specific args
     beta: float = 0.05
@@ -225,13 +225,14 @@ class Args:
     """the clip range"""
     gamma: float = 1
     """the discount factor"""
-    kl_estimator: Literal["kl1", "kl2", "kl3"] = "kl1"
+    kl_estimator: Literal["kl1", "kl2", "kl3", "kl4"] = "kl3"
     """the KL estimator to use"""
     apply_verifiable_reward: bool = False
     """whether to apply verifiable reward"""
     reward_model_multiplier: float = 1.0
     """the reward model multiplier, for down/upscaling the reward model output"""
-    answer_extraction_model: str = None
+    verification_reward: float = 10.0
+    """the reward value for verifiable responses"""
 
     # async setting
     async_mode: bool = True
@@ -276,6 +277,8 @@ class Args:
     """Where to save the model"""
     checkpoint_output_dir: Optional[str] = None
     """Where to save the model checkpoints in case of preemption"""
+    cache_dataset_only: bool = False
+    """Immediately exit after caching the dataset"""
 
     # Ai2 specific settings
     try_launch_beaker_eval_jobs: bool = True
@@ -291,9 +294,10 @@ class Args:
 
     def __post_init__(self):
         assert self.number_samples_per_prompt > 1, "Number of samples per prompt must be greater than 1 for GRPO!"
-        self.dataset_mixer_dict, self.dataset_mixer = process_dataset_mixer(self.dataset_mixer)
-        if self.dataset_eval_mixer is not None:
-            self.dataset_eval_mixer_dict, self.dataset_eval_mixer = process_dataset_mixer(self.dataset_eval_mixer)
+
+    #     self.dataset_mixer_dict, self.dataset_mixer = process_dataset_mixer(self.dataset_mixer)
+    #     if self.dataset_eval_mixer is not None:
+    #         self.dataset_eval_mixer_dict, self.dataset_eval_mixer = process_dataset_mixer(self.dataset_eval_mixer)
 
 
 def process_dataset_mixer(value) -> Tuple[Optional[dict], Optional[str]]:
@@ -487,6 +491,34 @@ def remove_padding(sequences, pad_token_id):
     return [[inneritem for inneritem in item if inneritem != pad_token_id] for item in sequences]
 
 
+class MetricsTracker:
+    """A simple class to prellocate all metrics in an array
+    so we can do only one allreduce operation to get the metrics mean"""
+
+    def __init__(self, max_metrics: int = 32, device: torch.device = torch.device("cuda")):
+        self.metrics = torch.zeros(max_metrics, device=device)
+        self.names2idx = {}
+        self.current_idx = 0
+        self.max_metrics = max_metrics
+
+    def add(self, name: str, value: torch.tensor):
+        if name not in self.names2idx:
+            if self.current_idx >= self.max_metrics:
+                raise ValueError(f"Exceeded maximum number of metrics ({self.max_metrics})")
+            self.names2idx[name] = self.current_idx
+            self.current_idx += 1
+
+        self.metrics[self.names2idx[name]] = value
+        return self
+
+    def get_reduced_metrics(self) -> dict[str, float]:
+        self.metrics /= dist.get_world_size()
+        dist.all_reduce(self.metrics, op=dist.ReduceOp.SUM)
+        # convert to list so to avoid multiple .item() torch calls
+        reduced_metrics = self.metrics.tolist()
+        return {name: reduced_metrics[idx] for name, idx in self.names2idx.items()}
+
+
 class ShufflingIterator:
     def __init__(self, data: np.ndarray, batch_size: int, seed: Optional[int] = None):
         self.data = data.copy()
@@ -627,7 +659,9 @@ class PolicyTrainerRayProcess(RayProcess):
         # reference model
         ds_config = get_eval_ds_config(
             offload=False,
-            stage=args.deepspeed_stage,
+            # inference model only has stage 3 (sharding) or stage 0 (no sharding)
+            # stage 2 is optimizer sharding which doesn't apply to inference
+            stage=args.deepspeed_stage if args.deepspeed_stage == 3 else 0,
             bf16=True,
         )
         ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
@@ -666,7 +700,9 @@ class PolicyTrainerRayProcess(RayProcess):
             disable_dropout_in_model(self.reward_model)
             ds_config = get_eval_ds_config(
                 offload=False,
-                stage=args.deepspeed_stage,
+                # inference model only has stage 3 (sharding) or stage 0 (no sharding)
+                # stage 2 is optimizer sharding which doesn't apply to inference
+                stage=args.deepspeed_stage if args.deepspeed_stage == 3 else 0,
                 bf16=True,
             )
             ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
@@ -815,6 +851,7 @@ class PolicyTrainerRayProcess(RayProcess):
             max_tokens=args.response_length,
             include_stop_str_in_output=True,
             n=args.number_samples_per_prompt,
+            stop=args.stop_strings,
         )
         # print("setup async queues")
         param_prompt_Q = None
@@ -898,14 +935,20 @@ class PolicyTrainerRayProcess(RayProcess):
             args.num_mini_batches * args.number_samples_per_prompt,
             args.gradient_accumulation_steps,
         )
+        non_score_reward_sum_stats = torch.zeros(stats_shape, device=device)
+        kl1_stats = torch.zeros((args.local_rollout_batch_size * args.number_samples_per_prompt), device=device)
+        kl2_stats = torch.zeros((args.local_rollout_batch_size * args.number_samples_per_prompt), device=device)
+        kl3_stats = torch.zeros((args.local_rollout_batch_size * args.number_samples_per_prompt), device=device)
+        kl4_stats = torch.zeros((args.local_rollout_batch_size * args.number_samples_per_prompt), device=device)
         approxkl_stats = torch.zeros(stats_shape, device=device)
         pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
+        loss_stats = torch.zeros(stats_shape, device=device)
         reward_mean = torch.zeros(stats_shape, device=device)
         reward_std = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
         ratio_stats = torch.zeros(stats_shape, device=device)
-        local_metrics = torch.zeros((20,), device=device)
+        local_metrics = MetricsTracker(max_metrics=32, device=device)
         episode = args.rollout_batch_size * (resume_training_step - 1)
 
         # training loop
@@ -923,8 +966,6 @@ class PolicyTrainerRayProcess(RayProcess):
         if accelerator.is_main_process:
             param_prompt_Q.put((None, remove_padding(global_queries, tokenizer.pad_token_id)))
 
-        answer_extraction_model = None
-        answer_extraction_tokenizer = None
         # for _ in range(1, resume_training_step):  # we didn't store scheduler state
         #     scheduler.step()
 
@@ -962,11 +1003,12 @@ class PolicyTrainerRayProcess(RayProcess):
                     ground_truths_next = data[GROUND_TRUTHS_KEY]
                     datasets_next = data[DATASET_SOURCE_KEY]
 
-                start_time = time.time()
+                start_time = time.perf_counter()
+                # torch.cuda.synchronize() # this could make the measurement more accurate
                 broadcast_to_vllm()
                 if accelerator.is_main_process:
                     print(
-                        f"🔥🔥🔥 Loading weights using shared memory; Time to load weights: {time.time() - start_time:.2f} seconds"
+                        f"🔥🔥🔥 Loading weights using shared memory; Time to load weights: {time.perf_counter() - start_time:.2f} seconds"
                     )
                     param_prompt_Q.put((None, remove_padding(global_queries, tokenizer.pad_token_id)))
             else:
@@ -1068,13 +1110,12 @@ class PolicyTrainerRayProcess(RayProcess):
                         ground_truth = ground_truths[i : i + args.local_rollout_forward_batch_size]
                         dataset = datasets[i : i + args.local_rollout_forward_batch_size]
                         verifiable_reward, verifiable_count = apply_verifiable_reward(
+                            postprocessed_response,
                             postprocessed_query_response,
                             tokenizer,
                             ground_truth,
                             dataset,
-                            verify_reward=10,
-                            answer_extraction_model=answer_extraction_model,
-                            answer_extraction_tokenizer=answer_extraction_tokenizer,
+                            verify_reward=args.verification_reward,
                         )
                         score += verifiable_reward
                     else:
@@ -1131,21 +1172,6 @@ class PolicyTrainerRayProcess(RayProcess):
                 reward_mean = mean_grouped_rewards
                 reward_std = std_grouped_rewards
 
-                # 4. compute rewards
-                kl1 = logprobs - ref_logprobs
-                kl2 = (kl1) ** 2 / 2
-                kl3 = (-kl1).exp() - 1 + kl1
-                if args.kl_estimator == "kl1":
-                    kl = kl1
-                elif args.kl_estimator == "kl2":
-                    kl = kl2
-                elif args.kl_estimator == "kl3":
-                    kl = kl3
-
-                non_score_reward = -args.beta * kl
-                non_score_reward_sum = non_score_reward.sum(1)
-                rlhf_reward = scores + non_score_reward_sum
-
             # print('training starts')
             # Do multiple epochs of training on on-policy data (PPO-style), with a fresh random shuffle in each epoch
             for epoch_idx in range(args.num_epochs):
@@ -1166,6 +1192,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         mb_responses = responses[micro_batch_inds]
                         mb_query_responses = query_responses[micro_batch_inds]
                         mb_logprobs = logprobs[micro_batch_inds]
+                        mb_reflogprobs = ref_logprobs[micro_batch_inds]
 
                         new_logprobs = self.forward(
                             mb_query_responses, mb_responses, tokenizer.pad_token_id, context_length, args.temperature
@@ -1176,18 +1203,40 @@ class PolicyTrainerRayProcess(RayProcess):
                         logprobs_diff = new_logprobs - mb_logprobs
                         ratio = torch.exp(logprobs_diff)
                         pg_losses = -mb_advantage[:, None] * ratio
-                        pg_losses2 = -mb_advantage[:, None] * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                        pg_losses2 = -mb_advantage[:, None] * torch.clamp(
+                            ratio, 1.0 - args.cliprange, 1.0 + args.cliprange
+                        )
                         pg_loss_max = torch.max(pg_losses, pg_losses2)
-                        pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+
+                        # Here we recalculate kl: we want the KL loss to backpropagate through the model
+                        # We also clamp the KL loss to avoid numerical instability
+                        # https://chatgpt.com/share/679d0ed9-8f48-8011-926e-e274b15ae8ae
+                        ref_logprobs_diff = (new_logprobs - mb_reflogprobs).clamp(-40.0, 40.0)
+                        kl1 = ref_logprobs_diff
+                        kl2 = (ref_logprobs_diff) ** 2 / 2
+                        kl3 = torch.expm1(-ref_logprobs_diff) + ref_logprobs_diff  # this is more numerically stable
+                        kl4 = ratio * ref_logprobs_diff
+                        if args.kl_estimator == "kl1":
+                            kl = kl1
+                        elif args.kl_estimator == "kl2":
+                            kl = kl2
+                        elif args.kl_estimator == "kl3":
+                            kl = kl3
+                        elif args.kl_estimator == "kl4":
+                            kl = kl4
                         # grpo change: directly subtract KL in loss (add)
-                        pg_loss = pg_loss + (args.beta * kl[micro_batch_inds]).mean()
-                        loss = pg_loss
+                        loss = masked_mean(pg_loss_max + (args.beta * kl), ~padding_mask[micro_batch_inds])
                         self.model.backward(loss)
                         # print("backward loss", self.rank, "micro batch start", micro_batch_start)
                         # print("trying to step", self.rank, "micro batch start", micro_batch_start)
                         self.model.step()
                         # print("step", self.rank, "micro batch start", micro_batch_start)
                         with torch.no_grad():
+                            if epoch_idx == 0:
+                                kl1_stats[micro_batch_inds] = kl1.sum(1).float()
+                                kl2_stats[micro_batch_inds] = kl2.sum(1).float()
+                                kl3_stats[micro_batch_inds] = kl3.sum(1).float()
+                                kl4_stats[micro_batch_inds] = kl4.sum(1).float()
                             # print("waiting for value model step", self.rank, "micro batch start", micro_batch_start)
                             # vf_loss, vf_clipfrac = ray.get(value_model_step_future)
                             pg_clipfrac = masked_mean(
@@ -1196,46 +1245,55 @@ class PolicyTrainerRayProcess(RayProcess):
                             # print("value model stepped", self.rank, "micro batch start", micro_batch_start)
                             # prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                             # entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                            non_score_reward = -args.beta * kl
+                            non_score_reward_sum_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
+                                non_score_reward.sum(1).mean()
+                            )
+                            # print("step finished", self.rank, "micro batch start", micro_batch_start)
                             approxkl = 0.5 * (logprobs_diff**2).mean()
                             approxkl_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                             pg_clipfrac_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
-                            pg_loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
+                            pg_loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = masked_mean(
+                                pg_loss_max, ~padding_mask[micro_batch_inds]
+                            )
+                            loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = loss
                             # entropy_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                             ratio_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     # fmt: off
-                    del mb_advantage, mb_responses, mb_query_responses, mb_logprobs
-                    del new_logprobs, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max, pg_loss, loss
+                    del mb_advantage, mb_responses, mb_query_responses, mb_logprobs, mb_reflogprobs
+                    del new_logprobs, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max, loss, ref_logprobs_diff, kl1, kl2, kl3, kl4
                     # fmt: on
                     # del everything and empty cache
                     torch.cuda.empty_cache()
                 del b_inds, mini_batch_inds
             # print("start metrics")
             with torch.no_grad():
-                local_metrics[0] = sequence_lengths.float().mean()
-                local_metrics[1] = (responses == args.stop_token_id).sum().float().mean()
-                local_metrics[2] = kl.sum(1).mean()
-                local_metrics[3] = (-logprobs).sum(1).mean()
-                local_metrics[4] = non_score_reward_sum.mean()
-                local_metrics[5] = rlhf_reward.mean()
-                local_metrics[6] = scores.mean()
-                local_metrics[7] = approxkl_stats.mean()
-                local_metrics[8] = pg_clipfrac_stats.mean()
-                local_metrics[9] = pg_loss_stats.mean()
-                local_metrics[10] = reward_mean.mean()
-                local_metrics[11] = reward_std.mean()
-                local_metrics[12] = entropy_stats.mean()
-                local_metrics[13] = ratio_stats.mean()
-                local_metrics[14] = ratio_stats.var()
-                local_metrics[15] = ((kl) ** 2 / 2).sum(1).mean()
-                local_metrics[16] = ((-kl).exp() - 1 + kl).sum(1).mean()
-                local_metrics[17] = verifiable_correct_rate
-                local_metrics[18] = contain_stop_token.float().mean()
-                # global_metrics = accelerator.reduce(local_metrics, reduction="mean").tolist()
-                local_metrics /= dist.get_world_size()
-                dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
-                global_metrics = local_metrics.tolist()
+                local_metrics.add("val/sequence_lengths", sequence_lengths.float().mean())
+                local_metrics.add("val/sequence_lengths_min", sequence_lengths.float().min())
+                local_metrics.add("val/sequence_lengths_max", sequence_lengths.float().max())
+                local_metrics.add("val/num_stop_token_ids", (responses == args.stop_token_id).sum().float().mean())
+                local_metrics.add("objective/kl", kl1_stats.mean())
+                local_metrics.add("objective/kl2", kl2_stats.mean())
+                local_metrics.add("objective/kl3", kl3_stats.mean())
+                local_metrics.add("objective/kl4", kl4_stats.mean())
+                local_metrics.add("objective/entropy", (-logprobs).sum(1).mean())
+                local_metrics.add("objective/non_score_reward", non_score_reward_sum_stats.mean())
+                local_metrics.add("objective/rlhf_reward", scores.mean() + non_score_reward_sum_stats.mean())
+                local_metrics.add("objective/scores", scores.mean())
+                local_metrics.add("objective/scores_mean", reward_mean.mean())
+                local_metrics.add("objective/reward_std", reward_std.mean())
+                local_metrics.add("objective/verifiable_correct_rate", verifiable_correct_rate)
+                local_metrics.add("loss/policy_avg", pg_loss_stats.mean())
+                local_metrics.add("loss/policy_avg", loss_stats.mean())
+                local_metrics.add("policy/approxkl_avg", approxkl_stats.mean())
+                local_metrics.add("policy/clipfrac_avg", pg_clipfrac_stats.mean())
+                local_metrics.add("policy/entropy_avg", entropy_stats.mean())
+                local_metrics.add("val/ratio", ratio_stats.mean())
+                local_metrics.add("val/ratio_var", ratio_stats.var())
+                local_metrics.add("val/stop_token_rate", contain_stop_token.float().mean())
+
                 metrics = {
                     "episode": episode,
                     "training_step": training_step,
@@ -1243,31 +1301,13 @@ class PolicyTrainerRayProcess(RayProcess):
                     "epoch": episode / len(train_dataset),
                     "time/from_scratch": time.time() - start_time,
                     "time/training": time.time() - training_time_start,
-                    "val/sequence_lengths": global_metrics[0],
-                    "val/num_stop_token_ids": global_metrics[1],
-                    "objective/kl": global_metrics[2],
-                    "objective/kl2": global_metrics[15],
-                    "objective/kl3": global_metrics[16],
-                    "objective/entropy": global_metrics[3],
-                    "objective/non_score_reward": global_metrics[4],
-                    "objective/rlhf_reward": global_metrics[5],
-                    "objective/scores": global_metrics[6],
-                    "policy/approxkl_avg": global_metrics[7],
-                    "policy/clipfrac_avg": global_metrics[8],
-                    "loss/policy_avg": global_metrics[9],
-                    "objective/scores_mean": global_metrics[10],
-                    "objective/reward_std": global_metrics[11],
-                    "policy/entropy_avg": global_metrics[12],
-                    "val/ratio": global_metrics[13],
-                    "val/ratio_var": global_metrics[14],
-                    "objective/verifiable_correct_rate": global_metrics[17],
-                    "val/stop_token_rate": global_metrics[18],
+                    **local_metrics.get_reduced_metrics(),
                 }
                 if accelerator.is_main_process:
                     print_rich_single_line_metrics(metrics)
                     metrics_queue.put((metrics, episode, df))
             del (queries, responses, postprocessed_responses, logprobs, ref_logprobs, sequence_lengths, scores)
-            del (global_metrics, metrics, kl)
+            del (metrics, kl)
             gc.collect()
             torch.cuda.empty_cache()
             # print(f"finished training {training_step}")
@@ -1292,6 +1332,7 @@ class PolicyTrainerRayProcess(RayProcess):
         if (
             args.try_auto_save_to_beaker
             and self.rank == 0
+            and is_beaker_job()
             and len(self.beaker_config.beaker_dataset_id_urls) > 0
             and args.output_dir.rstrip("/") != "/output"
         ):
@@ -1365,7 +1406,7 @@ class PolicyTrainerRayProcess(RayProcess):
             else:
                 leaderboard_name = args.hf_repo_revision
             if args.hf_metadata_dataset:
-                dataset_list = list(args.dataset_mixer_dict.keys())
+                dataset_list = args.dataset_mixer_list
                 # mainly just focussing here on what would be useful for the leaderboard.
                 # wandb will have even more useful information.
                 metadata_blob = {
@@ -1395,10 +1436,8 @@ python scripts/submit_eval_jobs.py \
     --preemptible \
     --use_hf_tokenizer_template \
     --beaker_image "nathanl/open_instruct_auto" \
-    --upload_to_hf allenai/tulu-3-evals \
-    --run_oe_eval_experiments \
+    --oe_eval_tasks gsm8k::tulu,minerva_math::tulu \
     --evaluate_on_weka \
-    --run_safety_evaluations \
     --run_id {wandb_url} \
     --step {training_step} \
     --skip_oi_evals"""
@@ -1515,76 +1554,54 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # create a tokenizer (pad from right)
-    config = AutoConfig.from_pretrained(model_config.model_name_or_path, revision=model_config.model_revision)
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_config.model_name_or_path, revision=model_config.model_revision, padding_side="right"
+    tokenizer_revision = (
+        model_config.model_revision if model_config.tokenizer_revision is None else model_config.tokenizer_revision
     )
-    if config.architectures == "LlamaForCausalLM" and config.bos_token_id == 128000:
-        tokenizer.pad_token_id = 128002  # <|reserved_special_token_0|>
-    else:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # NOTE: we do not resize the embedding
-    if dataset_config.chat_template is not None:
-        tokenizer.chat_template = CHAT_TEMPLATES[dataset_config.chat_template]
-
-    # create the dataset
-    dataset_dict = DatasetDict()
-    dataset_processor = SFTGroundTruthDatasetProcessor(tokenizer=tokenizer, config=dataset_config)
-    if len(args.dataset_train_splits) != len(args.dataset_mixer_dict) and len(args.dataset_train_splits) == 1:
-        args.dataset_train_splits = [args.dataset_train_splits[0]] * len(args.dataset_mixer_dict)
-        print(
-            f"Dataset splits not provided for all datasets. Using the same {args.dataset_train_splits[0]} split for all datasets."
-        )
-    # if len(args.dataset_eval_splits) != len(args.dataset_eval_mixer_dict) and len(args.dataset_eval_splits) == 1:
-    #     args.dataset_eval_splits = [args.dataset_eval_splits[0]] * len(args.dataset_eval_mixer_dict)
-    #     print(
-    #         f"Dataset splits not provided for all datasets. Using the same {args.dataset_eval_splits[0]} split for all datasets."
-    #     )
-    train_dataset = combine_dataset(
-        args.dataset_mixer_dict,
-        splits=args.dataset_train_splits,
-        columns_to_keep=[
-            dataset_config.sft_messages_key,
-            dataset_config.ground_truths_key,
-            dataset_config.dataset_source_key,
-        ],
+    tokenizer_name = (
+        model_config.tokenizer_name if model_config.tokenizer_name is not None else model_config.model_name_or_path
     )
-    if dataset_config.sanity_check:
-        train_dataset = train_dataset.select(
-            range(0, min(len(train_dataset), dataset_config.sanity_check_max_samples))
-        )
-    train_dataset = dataset_processor.tokenize(train_dataset)
-    train_dataset = dataset_processor.filter(train_dataset, need_contain_labels=False)
-    dataset_dict["train"] = train_dataset
+    if tokenizer_revision != model_config.model_revision:
+        # Warn user if tokenizer and model use different revisions; this is an unusual
+        # use case.
+        warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
+                   from the model revision `{model_config.model_revision}`."""
+        print(warning)
+    tc = TokenizerConfig(
+        model_name_or_path=tokenizer_name,
+        revision=model_config.model_revision,
+        use_fast=not model_config.use_slow_tokenizer,
+        chat_template_name=model_config.chat_template_name,
+        add_bos=model_config.add_bos,
+    )
+    tokenizer = tc.tokenizer
+    train_dataset = get_cached_dataset_rlvr(
+        args.dataset_mixer_list,
+        args.dataset_mixer_list_splits,
+        tc,
+        dataset_config.max_prompt_token_length,
+        dataset_config.max_token_length,
+        args.hf_entity,
+    )
+    train_dataset.shuffle(seed=args.seed)
     eval_dataset = None
-    if args.dataset_eval_mixer is not None:
-        eval_dataset = combine_dataset(
-            args.dataset_eval_mixer_dict,
-            splits=args.dataset_eval_splits,
-            columns_to_keep=[
-                dataset_config.sft_messages_key,
-                dataset_config.ground_truths_key,
-                dataset_config.dataset_source_key,
-            ],
+    if args.dataset_mixer_eval_list is not None:
+        eval_dataset = get_cached_dataset_rlvr(
+            args.dataset_mixer_eval_list,
+            args.dataset_mixer_eval_list_splits,
+            tc,
+            dataset_config.max_prompt_token_length,
+            dataset_config.max_token_length,
+            args.hf_entity,
         )
-        if dataset_config.sanity_check:
-            eval_dataset = eval_dataset.select(
-                range(0, min(len(eval_dataset), dataset_config.sanity_check_max_samples))
-            )
-        eval_dataset = dataset_processor.tokenize(eval_dataset)
-        eval_dataset = dataset_processor.filter(eval_dataset, need_contain_labels=False)
-        dataset_dict["eval"] = eval_dataset
+        eval_dataset.shuffle(seed=args.seed)
+    if args.cache_dataset_only:
+        return
+
     data_collator = SimpleGenerateCollatorWithGroundTruth(pad_token_id=tokenizer.pad_token_id)
 
     # some more runtime logging
     pprint([args, dataset_config, model_config])
     visualize_token(train_dataset[0][INPUT_IDS_PROMPT_KEY], tokenizer)
-    if args.with_tracking:
-        # upload the visualized token length
-        dataset_processor.get_token_length_visualization(
-            dataset_dict, save_path=f"runs/{args.run_name}/token_length.png"
-        )
-        wandb.log({"token_length": wandb.Image(f"runs/{args.run_name}/token_length.png")})
 
     # create the model and optimizer
     pg = None
@@ -1668,7 +1685,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     # Ai2 specific logic
     if is_beaker_job():
         if args.hf_metadata_dataset:
-            dataset_list = list(args.dataset_mixer_dict.keys())
+            dataset_list = args.dataset_mixer_list
             # mainly just focussing here on what would be useful for the leaderboard.
             # wandb will have even more useful information.
             metadata_blob = {
