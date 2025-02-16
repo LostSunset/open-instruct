@@ -448,7 +448,7 @@ def main(args: FlatArguments):
         logger.warning(warning)
     tc = TokenizerConfig(
         model_name_or_path=tokenizer_name,
-        revision=args.model_revision,
+        revision=tokenizer_revision,
         use_fast=not args.use_slow_tokenizer,
         chat_template_name=args.chat_template_name,
         add_bos=args.add_bos,
@@ -463,7 +463,7 @@ def main(args: FlatArguments):
             args.max_seq_length,
             args.hf_entity,
         )
-        train_dataset.shuffle(seed=args.seed)
+        train_dataset = train_dataset.shuffle(seed=args.seed)
         train_dataset.set_format(type="pt")
     if args.cache_dataset_only:
         return
