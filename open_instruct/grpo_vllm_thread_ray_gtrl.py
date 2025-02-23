@@ -31,6 +31,7 @@
 import gc
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -245,6 +246,8 @@ class Args:
     # ray
     actor_num_gpus_per_node: List[int] = field(default_factory=lambda: [1])
     """number of gpus per node for actor"""
+    single_gpu_mode: bool = False
+    """whether to collocate vLLM and actor on the same node (mostly for debugging purposes)"""
     vllm_num_engines: int = 1
     """number of vLLM Engines, set to 0 to disable vLLM"""
     vllm_tensor_parallel_size: int = 1
@@ -253,6 +256,8 @@ class Args:
     """whether to enforce eager mode for vLLM -- slow inference but needed for multi-node"""
     vllm_sync_backend: str = "nccl"
     """DeepSpeed -> vLLM weight sync backend"""
+    vllm_gpu_memory_utilization: float = 0.9
+    """vLLM GPU memory utilization"""
     enable_prefix_caching: bool = False
     """whether to enable prefix caching"""
     deepspeed_stage: int = 0
@@ -854,6 +859,14 @@ class PolicyTrainerRayProcess(RayProcess):
             n=args.number_samples_per_prompt,
             stop=args.stop_strings,
         )
+        evaluation_generation_config = SamplingParams(
+            temperature=0.001,
+            top_p=1.0,
+            max_tokens=args.response_length,
+            include_stop_str_in_output=True,
+            n=1,  # since we are doing greedy sampling, don't need to generate more
+            stop=args.stop_strings,
+        )
         # print("setup async queues")
         param_prompt_Q = None
         response_ids_Q = None
@@ -876,34 +889,42 @@ class PolicyTrainerRayProcess(RayProcess):
             eval_freq: int,
             resume_training_step: int,
         ):
-            llm = vllm_engines[0]
+            def generate_with_engines(prompts: List[List[int]], sampling_params: SamplingParams):
+                # Split queries between engines
+                queries_per_engine = math.ceil(len(prompts) / len(vllm_engines))
+                split_queries = [
+                    prompts[i : i + queries_per_engine] for i in range(0, len(prompts), queries_per_engine)
+                ]
+                # Generate responses in parallel across engines
+                futures = [
+                    vllm_engine.generate.remote(
+                        sampling_params=sampling_params, prompt_token_ids=queries, use_tqdm=False
+                    )
+                    for vllm_engine, queries in zip(vllm_engines, split_queries)
+                ]
+                # Gather all responses
+                all_outputs = ray.get(futures)
+                response_ids = []
+                for outputs in all_outputs:
+                    response_ids.extend([list(out.token_ids) for output in outputs for out in output.outputs])
+                return response_ids
+
             for training_step in range(resume_training_step, num_training_steps + 1):
                 items = param_prompt_Q.get()
                 if items is None:
                     break
-                unwrapped_model, g_queries_list = items
-                # if unwrapped_model is not None:
-                generation_start_time = time.time()
+                _, g_queries_list = items
 
-                outputs = ray.get(
-                    llm.generate.remote(
-                        sampling_params=generation_config, prompt_token_ids=g_queries_list, use_tqdm=False
-                    )
-                )
-                response_ids = [list(out.token_ids) for output in outputs for out in output.outputs]
+                generation_start_time = time.time()
+                response_ids = generate_with_engines(g_queries_list, generation_config)
                 print(f"🔥🔥🔥 Generation time: {time.time() - generation_start_time:.2f} seconds")
                 response_ids_Q.put(response_ids)
 
+                # Evaluate the model
                 if sample_evaluation_prompt_token_ids is not None and (training_step - 1) % eval_freq == 0:
-                    outputs = ray.get(
-                        llm.generate.remote(
-                            prompt_token_ids=sample_evaluation_prompt_token_ids,
-                            sampling_params=generation_config,
-                            use_tqdm=False,
-                        )
+                    response_ids = generate_with_engines(
+                        sample_evaluation_prompt_token_ids, evaluation_generation_config
                     )
-                    # for evaluation, even if we have multiple outputs, we only look at one of them for simplicity
-                    response_ids = [list(output.outputs[0].token_ids) for output in outputs]
                     evaluation_Q.put(response_ids)
 
         resume_training_step = 1
@@ -1492,11 +1513,12 @@ class ModelGroup:
         pg: PlacementGroup,
         ray_process_cls: RayProcess,
         num_gpus_per_node: List[int],
+        single_gpu_mode: bool,
     ):
         self.pg = pg
         self.ray_process_cls = ray_process_cls
         self.num_gpus_per_node = num_gpus_per_node
-        self.num_gpus_per_actor = 1
+        self.num_gpus_per_actor = 0.48 if single_gpu_mode else 1
         self.num_cpus_per_actor = 4
         self.models = []
         world_size = sum(self.num_gpus_per_node)
@@ -1630,6 +1652,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         pg,
         PolicyTrainerRayProcess,
         args.actor_num_gpus_per_node,
+        args.single_gpu_mode,
     )
     wandb_url = wandb.run.get_url() if args.with_tracking else None
     inits.extend(
@@ -1645,6 +1668,9 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         args.seed,
         args.enable_prefix_caching,
         max_len,
+        args.vllm_gpu_memory_utilization,
+        args.single_gpu_mode,
+        pg=pg if args.single_gpu_mode else None,
     )
 
     metrics_queue = RayQueue()
