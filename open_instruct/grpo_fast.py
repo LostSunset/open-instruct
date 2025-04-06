@@ -28,35 +28,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # isort: off
-from collections import defaultdict
-import json
 import os
-import shutil
 
 os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
+try:
+    import deepspeed
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+    # @vwxyzjn: when importing on CPU-only machines, we get the following error:
+    # RuntimeError: 0 active drivers ([]). There should only be one.
+    # so we need to catch the exception and do nothing
+    # https://github.com/deepspeedai/DeepSpeed/issues/7028
+except Exception:
+    pass
 # isort: on
 
-
+import json
 import logging
 import os
 import random
+import shutil
 import socket
 import threading
 import time
 import traceback
 from argparse import Namespace
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from queue import Empty, Queue
 from typing import Callable, Iterator, List, Literal, Optional
 
-import deepspeed
 import numpy as np
 import pandas as pd
 import ray
 import torch
 import torch.utils
 import torch.utils.data
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from huggingface_hub import HfApi
 from peft import PeftModel, get_peft_model_state_dict
 from ray.util.placement_group import PlacementGroup, placement_group
@@ -295,8 +302,6 @@ class Args:
     """the priority of auto-launched evaluation jobs"""
 
     def __post_init__(self):
-        if self.single_gpu_mode:
-            self.vllm_gpu_memory_utilization = 0.3
         assert self.num_samples_per_prompt_rollout > 1, "Number of samples per prompt must be greater than 1 for GRPO!"
         assert (
             self.apply_verifiable_reward or self.apply_r1_style_format_reward or self.non_stop_penalty
@@ -785,6 +790,7 @@ class PolicyTrainerRayProcess(RayProcess):
             kl2_stats = torch.zeros(len(collated_query_responses))
             kl3_stats = torch.zeros(len(collated_query_responses))
             kl4_stats = torch.zeros(len(collated_query_responses))
+            kl_loss_stats = torch.zeros(len(collated_query_responses))
             pg_clipfrac_stats = torch.zeros(len(collated_query_responses))
             pg_loss_stats = torch.zeros(len(collated_query_responses))
             loss_stats = torch.zeros(len(collated_query_responses))
@@ -851,6 +857,14 @@ class PolicyTrainerRayProcess(RayProcess):
                         kl2_stats[i] = masked_mean(kl2, mb_response_masks_bool, args.masked_mean_axis).float()
                         kl3_stats[i] = masked_mean(kl3, mb_response_masks_bool, args.masked_mean_axis).float()
                         kl4_stats[i] = masked_mean(kl4, mb_response_masks_bool, args.masked_mean_axis).float()
+                        if args.kl_estimator == "kl1":
+                            kl_loss_stats[i] = kl1_stats[i] * args.beta
+                        elif args.kl_estimator == "kl2":
+                            kl_loss_stats[i] = kl2_stats[i] * args.beta
+                        elif args.kl_estimator == "kl3":
+                            kl_loss_stats[i] = kl3_stats[i] * args.beta
+                        elif args.kl_estimator == "kl4":
+                            kl_loss_stats[i] = kl4_stats[i] * args.beta
                         pg_clipfrac_stats[i] = masked_mean(
                             (pg_losses2 > pg_losses).float(), mb_response_masks_bool, args.masked_mean_axis
                         )
@@ -864,7 +878,8 @@ class PolicyTrainerRayProcess(RayProcess):
                 self.local_metrics.add("objective/kl3_avg", kl3_stats.mean())
                 self.local_metrics.add("objective/kl4_avg", kl4_stats.mean())
                 self.local_metrics.add("loss/policy_avg", pg_loss_stats.mean())
-                self.local_metrics.add("loss/policy_avg", loss_stats.mean())
+                self.local_metrics.add("loss/kl_avg", kl_loss_stats.mean())
+                self.local_metrics.add("loss/total_avg", loss_stats.mean())
                 self.local_metrics.add("policy/clipfrac_avg", pg_clipfrac_stats.mean())
                 self.local_metrics.add("val/ratio", ratio_stats.mean())
                 self.local_metrics.add("val/ratio_var", ratio_stats.var())
@@ -1620,6 +1635,7 @@ if __name__ == "__main__":
     ) -> List[float]:
         scores = [0] * len(decoded_responses)
         metrics = {}
+
         if args.apply_r1_style_format_reward:
             with Timer("[Data Preparation Thread] Calculating rewards -- 🧮 Calculating format reward"):
                 format_scores = soft_format_reward_func(decoded_responses, args.r1_style_format_reward)
